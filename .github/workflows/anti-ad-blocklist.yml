@@ -1,0 +1,75 @@
+name: anti-AD blocklist
+
+on:
+  schedule:
+    - cron: '17 4 * * 1' # 周一北京时间 12:17，GitHub 可能延迟执行
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: anti-ad-blocklist-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Download pinned converter and current anti-AD domains
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --max-time 180 \
+            'https://raw.githubusercontent.com/M-Abozaid/esp32-c3-adblock/238ef7b27097e8597f39e9a5ce07a958488572a2/tools/build_blocklist.py' \
+            -o build_blocklist.py
+          curl -fL --retry 3 --max-time 180 \
+            'https://raw.githubusercontent.com/privacy-protection-tools/anti-AD/master/anti-ad-domains.txt' \
+            -o anti-ad-domains.txt
+      - name: Convert and validate legacy raw 40-bit hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python build_blocklist.py blocklist.bin anti-ad-domains.txt
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          data = Path('blocklist.bin').read_bytes()
+          count = len(data) // 5
+          assert len(data) % 5 == 0, 'Not a raw 5-byte hash list'
+          assert 50_000 <= count <= 240_000, 'Unexpected count or excessive size'
+          previous = -1
+          for i in range(0, len(data), 5):
+              value = int.from_bytes(data[i:i+5], 'little')
+              assert value > previous, 'Hashes must be strictly increasing'
+              previous = value
+          source = Path('anti-ad-domains.txt').read_text(encoding='utf-8')
+          version = next((s for s in source.splitlines() if s.startswith('#VER=')), 'unknown')
+          Path('metadata.json').write_text(json.dumps({
+              'source': 'anti-AD', 'source_version': version,
+              'format': 'legacy raw 40-bit little-endian hashes',
+              'entries': count, 'bytes': len(data),
+              'sha256': hashlib.sha256(data).hexdigest()
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(f'Validated {count} entries, {len(data)} bytes')
+          PY
+          sha256sum blocklist.bin > blocklist.bin.sha256
+      - name: Publish validated blocklist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=anti-ad-blocklist
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --notes-file metadata.json
+          else
+            gh release create "$tag" --title 'anti-AD ESP32 blocklist' \
+              --notes-file metadata.json --latest=false
+          fi
+          gh release upload "$tag" blocklist.bin blocklist.bin.sha256 metadata.json --clobber
